@@ -1,0 +1,426 @@
+From 21c3d30ff76a584636d3dce66dfbd16a53da6db8 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Sat, 3 Oct 2026 11:26:21 +0000
+Subject: [PATCH] Fix login failures caused by case-sensitive emails
+
+Normalize emails on register/login, look up legacy mixed-case rows
+case-insensitively, show Russian auth errors, and add password change.
+---
+ backend/app/api/auth.py           | 38 ++++++++++++++++++++++++-------
+ backend/app/api/users.py          | 24 ++++++++++++++++---
+ backend/app/schemas/user.py       | 36 +++++++++++++++++++++++++----
+ backend/tests/test_auth.py        | 37 ++++++++++++++++++++++++++++++
+ mobile/src/api/auth.ts            |  5 ++++
+ mobile/src/screens/AuthScreen.tsx |  9 ++++----
+ mobile/src/utils/authErrors.ts    | 19 ++++++++++++++++
+ web/src/api/auth.ts               |  3 +++
+ web/src/pages/AuthPage.tsx        |  9 ++++----
+ web/src/utils/authErrors.test.ts  | 16 +++++++++++++
+ web/src/utils/authErrors.ts       | 19 ++++++++++++++++
+ 11 files changed, 192 insertions(+), 23 deletions(-)
+ create mode 100644 backend/tests/test_auth.py
+ create mode 100644 mobile/src/utils/authErrors.ts
+ create mode 100644 web/src/utils/authErrors.test.ts
+ create mode 100644 web/src/utils/authErrors.ts
+
+diff --git a/backend/app/api/auth.py b/backend/app/api/auth.py
+index 0a81cf5..a05dd32 100644
+--- a/backend/app/api/auth.py
++++ b/backend/app/api/auth.py
+@@ -1,28 +1,48 @@
+ from typing import Annotated
+ 
+ from fastapi import APIRouter, Depends, HTTPException, status
+-from sqlalchemy import select
++from sqlalchemy import func, select
+ from sqlalchemy.ext.asyncio import AsyncSession
+ 
+ from app.core.database import get_db
+ from app.core.security import create_access_token, hash_password, verify_password
+ from app.models.user import User
+-from app.schemas.user import TokenResponse, UserLogin, UserRegister
++from app.schemas.user import TokenResponse, UserLogin, UserRegister, normalize_email
+ 
+ router = APIRouter(prefix="/auth", tags=["auth"])
+ 
+ 
++async def _find_user_by_email(db: AsyncSession, email: str) -> User | None:
++    """Find user by email, tolerant of legacy mixed-case rows."""
++    normalized = normalize_email(email)
++    exact = await db.execute(select(User).where(User.email == normalized))
++    user = exact.scalar_one_or_none()
++    if user:
++        return user
++    # Older rows may keep mixed-case local parts; avoid MultipleResultsFound.
++    legacy = await db.execute(
++        select(User).where(func.lower(User.email) == normalized).limit(1)
++    )
++    return legacy.scalars().first()
++
++
+ @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+ async def register(body: UserRegister, db: Annotated[AsyncSession, Depends(get_db)]):
++    email = normalize_email(body.email)
+     result = await db.execute(
+-        select(User).where((User.email == body.email) | (User.username == body.username))
++        select(User).where(
++            (func.lower(User.email) == email) | (User.username == body.username)
++        )
+     )
+     if result.scalar_one_or_none():
+-        raise HTTPException(status_code=400, detail="Email or username already taken")
++        raise HTTPException(
++            status_code=400,
++            detail="Email или имя пользователя уже заняты",
++        )
+ 
+     user = User(
+         username=body.username,
+-        email=body.email,
++        email=email,
+         password_hash=hash_password(body.password),
+     )
+     db.add(user)
+@@ -34,10 +54,12 @@ async def register(body: UserRegister, db: Annotated[AsyncSession, Depends(get_d
+ 
+ @router.post("/login", response_model=TokenResponse)
+ async def login(body: UserLogin, db: Annotated[AsyncSession, Depends(get_db)]):
+-    result = await db.execute(select(User).where(User.email == body.email))
+-    user = result.scalar_one_or_none()
++    user = await _find_user_by_email(db, body.email)
+ 
+     if not user or not verify_password(body.password, user.password_hash):
+-        raise HTTPException(status_code=401, detail="Invalid credentials")
++        raise HTTPException(
++            status_code=401,
++            detail="Неверный email или пароль",
++        )
+ 
+     return TokenResponse(access_token=create_access_token(user.id))
+diff --git a/backend/app/api/users.py b/backend/app/api/users.py
+index 9893494..e02ec37 100644
+--- a/backend/app/api/users.py
++++ b/backend/app/api/users.py
+@@ -10,9 +10,9 @@ from app.core.database import get_db
+ from app.core.deps import get_current_user
+ from app.core.e2e import decode_public_key_b64
+ from app.core.e2e_users import get_direct_chat_partner_ids
+-from app.core.security import verify_password
++from app.core.security import hash_password, verify_password
+ from app.models.user import User
+-from app.schemas.user import UserOut
++from app.schemas.user import ChangePasswordBody, UserOut
+ from app.ws.hub import manager
+ 
+ router = APIRouter(prefix="/users", tags=["users"])
+@@ -92,6 +92,24 @@ async def get_me(current_user: Annotated[User, Depends(get_current_user)]):
+     return current_user
+ 
+ 
++@router.post("/me/password")
++async def change_password(
++    body: ChangePasswordBody,
++    current_user: Annotated[User, Depends(get_current_user)],
++    db: Annotated[AsyncSession, Depends(get_db)],
++):
++    """Смена пароля аккаунта (нужен текущий пароль)."""
++    if not verify_password(body.current_password, current_user.password_hash):
++        raise HTTPException(status_code=401, detail="Неверный текущий пароль")
++
++    if body.current_password == body.new_password:
++        raise HTTPException(status_code=400, detail="Новый пароль должен отличаться от текущего")
++
++    current_user.password_hash = hash_password(body.new_password)
++    await db.commit()
++    return {"ok": True}
++
++
+ @router.put("/me/key", response_model=PublicKeyOut)
+ async def upload_public_key(
+     body: UploadKeyBody,
+@@ -127,7 +145,7 @@ async def rotate_public_key(
+ ):
+     """Ротация публичного ключа с подтверждением паролем аккаунта."""
+     if not verify_password(body.password, current_user.password_hash):
+-        raise HTTPException(status_code=401, detail="Invalid password")
++        raise HTTPException(status_code=401, detail="Неверный пароль")
+ 
+     return await _set_public_key_and_notify(
+         current_user,
+diff --git a/backend/app/schemas/user.py b/backend/app/schemas/user.py
+index 97896ce..b841330 100644
+--- a/backend/app/schemas/user.py
++++ b/backend/app/schemas/user.py
+@@ -1,6 +1,11 @@
+ from datetime import datetime
+ 
+-from pydantic import BaseModel, EmailStr, field_validator
++from pydantic import BaseModel, EmailStr, Field, field_validator
++
++
++def normalize_email(value: str) -> str:
++    """Strip whitespace and lowercase so login/register match reliably."""
++    return value.strip().lower()
+ 
+ 
+ class UserRegister(BaseModel):
+@@ -11,17 +16,23 @@ class UserRegister(BaseModel):
+     @field_validator("username")
+     @classmethod
+     def username_valid(cls, v: str) -> str:
++        v = v.strip()
+         if len(v) < 3 or len(v) > 64:
+-            raise ValueError("Username must be 3–64 characters")
++            raise ValueError("Имя пользователя: 3–64 символа")
+         if not v.replace("_", "").replace(".", "").isalnum():
+-            raise ValueError("Username may only contain letters, digits, _ and .")
++            raise ValueError("Имя пользователя: только буквы, цифры, _ и .")
+         return v
+ 
++    @field_validator("email")
++    @classmethod
++    def email_normalize(cls, v: EmailStr) -> str:
++        return normalize_email(str(v))
++
+     @field_validator("password")
+     @classmethod
+     def password_valid(cls, v: str) -> str:
+         if len(v) < 8:
+-            raise ValueError("Password must be at least 8 characters")
++            raise ValueError("Пароль должен быть не короче 8 символов")
+         return v
+ 
+ 
+@@ -29,12 +40,29 @@ class UserLogin(BaseModel):
+     email: EmailStr
+     password: str
+ 
++    @field_validator("email")
++    @classmethod
++    def email_normalize(cls, v: EmailStr) -> str:
++        return normalize_email(str(v))
++
+ 
+ class TokenResponse(BaseModel):
+     access_token: str
+     token_type: str = "bearer"
+ 
+ 
++class ChangePasswordBody(BaseModel):
++    current_password: str
++    new_password: str = Field(min_length=8)
++
++    @field_validator("new_password")
++    @classmethod
++    def password_valid(cls, v: str) -> str:
++        if len(v) < 8:
++            raise ValueError("Пароль должен быть не короче 8 символов")
++        return v
++
++
+ class UserOut(BaseModel):
+     id: str
+     username: str
+diff --git a/backend/tests/test_auth.py b/backend/tests/test_auth.py
+new file mode 100644
+index 0000000..717cbbe
+--- /dev/null
++++ b/backend/tests/test_auth.py
+@@ -0,0 +1,37 @@
++import unittest
++
++from app.schemas.user import UserLogin, UserRegister, normalize_email
++
++
++class TestEmailNormalization(unittest.TestCase):
++    def test_normalize_email_strips_and_lowercases(self):
++        self.assertEqual(normalize_email("  CaseUser@Example.COM "), "caseuser@example.com")
++
++    def test_register_schema_normalizes_email(self):
++        body = UserRegister(
++            username="alice",
++            email="Alice@Example.COM",
++            password="password123",
++        )
++        self.assertEqual(body.email, "alice@example.com")
++
++    def test_login_schema_normalizes_email(self):
++        body = UserLogin(email="Bob@Example.COM", password="password123")
++        self.assertEqual(body.email, "bob@example.com")
++
++    def test_register_rejects_short_password(self):
++        with self.assertRaises(Exception):
++            UserRegister(username="alice", email="a@b.com", password="short")
++
++
++class TestPasswordHashRoundtrip(unittest.TestCase):
++    def test_hash_and_verify(self):
++        from app.core.security import hash_password, verify_password
++
++        hashed = hash_password("correct-horse")
++        self.assertTrue(verify_password("correct-horse", hashed))
++        self.assertFalse(verify_password("wrong-password", hashed))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/mobile/src/api/auth.ts b/mobile/src/api/auth.ts
+index 5fe796a..53c033f 100644
+--- a/mobile/src/api/auth.ts
++++ b/mobile/src/api/auth.ts
+@@ -7,4 +7,9 @@ export const authApi = {
+ 
+   login: (email: string, password: string) =>
+     http.post<TokenResponse>('/auth/login', {email, password}).then(r => r.data),
++
++  changePassword: (current_password: string, new_password: string) =>
++    http
++      .post<{ok: boolean}>('/users/me/password', {current_password, new_password})
++      .then(r => r.data),
+ };
+diff --git a/mobile/src/screens/AuthScreen.tsx b/mobile/src/screens/AuthScreen.tsx
+index 8a04ed2..02c6659 100644
+--- a/mobile/src/screens/AuthScreen.tsx
++++ b/mobile/src/screens/AuthScreen.tsx
+@@ -11,6 +11,7 @@ import {
+ } from 'react-native';
+ import {authApi} from '../api/auth';
+ import {useAuthStore} from '../store/auth';
++import {formatAuthError} from '../utils/authErrors';
+ 
+ export default function AuthScreen() {
+   const [mode, setMode] = useState<'login' | 'register'>('login');
+@@ -28,12 +29,12 @@ export default function AuthScreen() {
+     try {
+       const data =
+         mode === 'login'
+-          ? await authApi.login(email, password)
+-          : await authApi.register(username, email, password);
++          ? await authApi.login(email.trim(), password)
++          : await authApi.register(username.trim(), email.trim(), password);
+       await setToken(data.access_token);
+     } catch (err: unknown) {
+-      const detail = (err as {response?: {data?: {detail?: string}}})?.response?.data?.detail;
+-      setError(detail ?? 'Что-то пошло не так');
++      const detail = (err as {response?: {data?: {detail?: unknown}}})?.response?.data?.detail;
++      setError(formatAuthError(detail));
+     } finally {
+       setLoading(false);
+     }
+diff --git a/mobile/src/utils/authErrors.ts b/mobile/src/utils/authErrors.ts
+new file mode 100644
+index 0000000..cc738e5
+--- /dev/null
++++ b/mobile/src/utils/authErrors.ts
+@@ -0,0 +1,19 @@
++/** Map backend auth error details to short Russian UI messages. */
++export function formatAuthError(detail: unknown, fallback = 'Что-то пошло не так'): string {
++  if (typeof detail !== 'string') {
++    if (Array.isArray(detail) && detail.length > 0) {
++      const first = detail[0] as {msg?: string};
++      if (typeof first?.msg === 'string') return first.msg;
++    }
++    return fallback;
++  }
++
++  const known: Record<string, string> = {
++    'Invalid credentials': 'Неверный email или пароль',
++    'Неверный email или пароль': 'Неверный email или пароль',
++    'Email or username already taken': 'Email или имя пользователя уже заняты',
++    'Email или имя пользователя уже заняты': 'Email или имя пользователя уже заняты',
++  };
++
++  return known[detail] ?? detail;
++}
+diff --git a/web/src/api/auth.ts b/web/src/api/auth.ts
+index 6c03308..d1e53cb 100644
+--- a/web/src/api/auth.ts
++++ b/web/src/api/auth.ts
+@@ -7,4 +7,7 @@ export const authApi = {
+ 
+   login: (email: string, password: string) =>
+     http.post<TokenResponse>("/auth/login", { email, password }).then((r) => r.data),
++
++  changePassword: (current_password: string, new_password: string) =>
++    http.post<{ ok: boolean }>("/users/me/password", { current_password, new_password }).then((r) => r.data),
+ };
+diff --git a/web/src/pages/AuthPage.tsx b/web/src/pages/AuthPage.tsx
+index 7e921ae..78aa125 100644
+--- a/web/src/pages/AuthPage.tsx
++++ b/web/src/pages/AuthPage.tsx
+@@ -2,6 +2,7 @@ import { useState } from "react";
+ import { useNavigate } from "react-router-dom";
+ import { authApi } from "../api/auth";
+ import { useAuthStore } from "../store/auth";
++import { formatAuthError } from "../utils/authErrors";
+ import s from "./AuthPage.module.css";
+ 
+ export default function AuthPage() {
+@@ -22,13 +23,13 @@ export default function AuthPage() {
+     try {
+       const data =
+         mode === "login"
+-          ? await authApi.login(email, password)
+-          : await authApi.register(username, email, password);
++          ? await authApi.login(email.trim(), password)
++          : await authApi.register(username.trim(), email.trim(), password);
+       await setToken(data.access_token);
+       navigate("/");
+     } catch (err: unknown) {
+-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+-      setError(detail ?? "Что-то пошло не так");
++      const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
++      setError(formatAuthError(detail));
+     } finally {
+       setLoading(false);
+     }
+diff --git a/web/src/utils/authErrors.test.ts b/web/src/utils/authErrors.test.ts
+new file mode 100644
+index 0000000..a378f26
+--- /dev/null
++++ b/web/src/utils/authErrors.test.ts
+@@ -0,0 +1,16 @@
++import { describe, expect, it } from "vitest";
++import { formatAuthError } from "./authErrors";
++
++describe("formatAuthError", () => {
++  it("maps legacy English invalid credentials", () => {
++    expect(formatAuthError("Invalid credentials")).toBe("Неверный email или пароль");
++  });
++
++  it("keeps Russian backend messages", () => {
++    expect(formatAuthError("Неверный email или пароль")).toBe("Неверный email или пароль");
++  });
++
++  it("falls back for unknown values", () => {
++    expect(formatAuthError(undefined)).toBe("Что-то пошло не так");
++  });
++});
+diff --git a/web/src/utils/authErrors.ts b/web/src/utils/authErrors.ts
+new file mode 100644
+index 0000000..9eea8a1
+--- /dev/null
++++ b/web/src/utils/authErrors.ts
+@@ -0,0 +1,19 @@
++/** Map backend auth error details to short Russian UI messages. */
++export function formatAuthError(detail: unknown, fallback = "Что-то пошло не так"): string {
++  if (typeof detail !== "string") {
++    if (Array.isArray(detail) && detail.length > 0) {
++      const first = detail[0] as { msg?: string };
++      if (typeof first?.msg === "string") return first.msg;
++    }
++    return fallback;
++  }
++
++  const known: Record<string, string> = {
++    "Invalid credentials": "Неверный email или пароль",
++    "Неверный email или пароль": "Неверный email или пароль",
++    "Email or username already taken": "Email или имя пользователя уже заняты",
++    "Email или имя пользователя уже заняты": "Email или имя пользователя уже заняты",
++  };
++
++  return known[detail] ?? detail;
++}
+-- 
+2.43.0
+
